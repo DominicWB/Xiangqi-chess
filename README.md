@@ -922,4 +922,4 @@ xqchess is free software, under the GNU General Public License, version 3 (see `
 
 `fairy/` contains the source of [Fairy-Stockfish](https://github.com/fairy-stockfish/Fairy-Stockfish), upstream commit `9f778da`, with this project's changes applied: `fairy/xqchess.patch`, described in `fairy/README.md`. Fairy-Stockfish is free software under the GNU General Public License, version 3 (`fairy/Copying.txt`). It is by Fabian Fichter and contributors (`fairy/AUTHORS`), and it is derived from [Stockfish](https://stockfishchess.org). The other programs here run it as a separate process.
 
-Snipers chess also appears as a challenge on [iwantcheckmate.com](https://iwantcheckmate.com), "Chess, But My Bishops are SNIPERS"; its challenge pages inspired the web page.
+These variants are from the iwantcheckmate YouTube channel.
