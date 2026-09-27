@@ -1,0 +1,25 @@
+# The compiled engines and their build files: build them with  python build.py
+/engine/xqchess
+/engine/xqchess.exe
+/engine/fairy-xqchess
+/engine/fairy-xqchess.exe
+/engine/obj/
+/build/
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini

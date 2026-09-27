@@ -1,0 +1,886 @@
+diff --git a/src/apiutil.h b/src/apiutil.h
+index c898cf2..bbfad96 100644
+--- a/src/apiutil.h
++++ b/src/apiutil.h
+@@ -321,6 +321,8 @@ inline const std::string move_to_san(Position& pos, Move m, Notation n) {
+             else
+                 san += '-';
+         }
++        else if (type_of(m) == SNIPE)
++            san += '*'; // a shot: the sniper takes without moving
+         else if (pos.capture(m))
+             san += 'x';
+         else if (n == NOTATION_LAN || n == NOTATION_THAI_LAN || (is_shogi(n) && (n != NOTATION_SHOGI_HOSKING || d == SQUARE_DISAMBIGUATION)) || n == NOTATION_JANGGI || (n == NOTATION_THAI_SAN && type_of(pos.moved_piece(m)) != PAWN))
+@@ -428,7 +430,7 @@ inline bool has_insufficient_material(Color c, const Position& pos) {
+         return false;
+ 
+     // Non-draw stalemate with lone custom king
+-    if (   pos.stalemate_value() != VALUE_DRAW && pos.king_type() != KING
++    if (   pos.stalemate_value() != VALUE_DRAW && pos.king_type(c) != KING
+         && pos.pieces(c, KING) && (pos.board_bb(c, KING) & pos.board_bb(~c, KING)))
+         return false;
+ 
+@@ -1049,7 +1051,7 @@ inline FenValidation validate_fen(const std::string& fen, const Variant* v, bool
+             return FEN_INVALID_NUMBER_OF_KINGS;
+ 
+         // check for touching kings if there are exactly two royal kings on the board (excluding pocket)
+-        if (   v->kingType == KING
++        if (   v->kingType[WHITE] == KING && v->kingType[BLACK] == KING
+             && piece_count(fenParts[0], WHITE, KING, v) - piece_count(pocket, WHITE, KING, v) == 1
+             && piece_count(fenParts[0], BLACK, KING, v) - piece_count(pocket, BLACK, KING, v) == 1)
+         {
+diff --git a/src/evaluate.cpp b/src/evaluate.cpp
+index 4418448..ef34dfc 100644
+--- a/src/evaluate.cpp
++++ b/src/evaluate.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <climits>
+ #include <cstdlib>
+ #include <cstring>   // For std::memset
+ #include <fstream>
+@@ -798,7 +799,7 @@ namespace {
+                  +       mg_value(mobility[Them] - mobility[Us]) * int(!pos.captures_to_hand())
+                  - 873 * !(pos.major_pieces(Them) || pos.captures_to_hand())
+                        * 2 / (2 + 2 * pos.check_counting() + 2 * pos.two_boards() + 2 * pos.makpong()
+-                                + (pos.king_type() != KING) * (pos.diagonal_lines() ? 1 : 2))
++                                + (pos.king_type(Us) != KING) * (pos.diagonal_lines() ? 1 : 2))
+                  - 100 * bool(attackedBy[Us][KNIGHT] & attackedBy[Us][KING])
+                  -   6 * mg_value(score) / 8
+                  -   4 * kingFlankDefense
+@@ -818,7 +819,7 @@ namespace {
+     if (pos.check_counting())
+         score += make_score(0, mg_value(score) * 2 / (2 + pos.checks_remaining(Them)));
+ 
+-    if (pos.king_type() == WAZIR)
++    if (pos.king_type(Us) == WAZIR)
+         score += make_score(0, mg_value(score) / 2);
+ 
+     // For drop games, king danger is independent of game phase, but dependent on material density
+@@ -1605,10 +1606,214 @@ make_v:
+ /// evaluate() is the evaluator for the outer world. It returns a static
+ /// evaluation of the position from the point of view of the side to move.
+ 
++/// xq_evaluate() is the evaluation of the xqchess variant (a Western chess army against a
++/// Xiangqi army on 8x8), with weights fitted to self-play results.  It mirrors evaluate() in
++/// the xqchess engine (engine/xqchess.cpp and pyengine.py) term by term and returns centipawns
++/// from the side to move's point of view.
++
++namespace {
++
++  inline int xq_center(Square s) {
++      int f = file_of(s), r = rank_of(s);
++      return std::min(f, 7 - f) + std::min(r, 7 - r);            // 0 in a corner .. 6 in the centre
++  }
++
++  // The xqchess engine's number for a role letter (the order of its piece letters .PNBRQKSHEAJCG)
++  inline int xq_type(char role) {
++      const char* p = role ? std::strchr(".pnbrqksheajcg", role) : nullptr;
++      return p ? int(p - ".pnbrqksheajcg") : 0;
++  }
++
++  // At most two piece types as one number, hi * 16 + lo (0 = none)
++  inline int xq_eg_code(const int* t, int n) {
++      return n == 0 ? 0 : n == 1 ? t[0] * 16 : std::max(t[0], t[1]) * 16 + std::min(t[0], t[1]);
++  }
++
++  // Mating technique for side a: drive the other royal to the edge and into a corner, and come close
++  inline int xq_mopup(const Position& pos, Color a, const Variant* v) {
++      Square d = pos.square<KING>(~a), k = pos.square<KING>(a);
++      int dist = std::abs(file_of(d) - file_of(k)) + std::abs(rank_of(d) - rank_of(k));
++      return v->xqMopupEdge * (7 - xq_center(d)) + v->xqMopupClose * (14 - dist);
++  }
++
++  // Known result of a king-against-general ending, in centipawns for the general's side g (see
++  // endgame_known() in pyengine.py): a bare general always loses; with at most two other pieces
++  // the result comes from the solved table xqEndgame.
++  bool xq_endgame_known(const Position& pos, Color g, const int types[COLOR_NB][2], const int* ntypes,
++                        const int* mat, int prr, const Variant* v, int& out) {
++      Color k = ~g;
++      if (!ntypes[g])
++      {
++          out = -(v->xqTbWin + mat[k] / 4 + xq_mopup(pos, k, v));
++          return true;
++      }
++      if (ntypes[g] + ntypes[k] > 2)
++          return false;
++      const int key = 65536 * prr + 256 * xq_eg_code(types[g], ntypes[g]) + xq_eg_code(types[k], ntypes[k]);
++      auto it = std::lower_bound(v->xqEndgame.begin(), v->xqEndgame.end(), std::make_pair(key, INT_MIN));
++      if (it == v->xqEndgame.end() || it->first != key)
++          return false;
++      const int val = it->second;
++      out = val + (mat[g] - mat[k]) * std::abs(val) / (8 * v->xqTbWin) + xq_mopup(pos, val > 0 ? g : k, v) * val / v->xqTbWin;
++      return true;
++  }
++
++  // Can a side with these counts (indexed by role letter) force mate against a bare royal?
++  inline bool xq_can_mate_bare(const int* cnt, bool general, const Variant* v) {
++      if (!general)
++      {
++          for (int ch = 'a'; ch <= 'z'; ++ch)
++              if (ch != 'k' && cnt[ch])
++                  return true;
++          return false;
++      }
++      if (cnt['q'])
++          return true;
++      int j = cnt['j'] + cnt['r'], ch = cnt['c'] + cnt['h'] + cnt['n'] + cnt['b'];
++      if (j >= 2 || (j >= 1 && ch >= 1))
++          return true;
++      return cnt['s'] && v->xqSoldierPromotion;
++  }
++
++} // namespace
++
++int Eval::xq_evaluate(const Position& pos) {
++
++  const Variant* v = pos.variant();
++  int sc[COLOR_NB] = {0, 0}, nonpawn = 0, bishops[COLOR_NB] = {0, 0}, cnt[COLOR_NB][128] = {};
++  int pieceMat[COLOR_NB] = {0, 0}, pawns[COLOR_NB] = {0, 0}, nonroyal[COLOR_NB] = {0, 0}, egAdj[COLOR_NB] = {0, 0};
++  int types[COLOR_NB][2] = {{0, 0}, {0, 0}}, mat[COLOR_NB] = {0, 0}, prr = 0;
++  const Bitboard occupied = pos.pieces();
++
++  for (Bitboard b = occupied; b; )
++  {
++      Square s = pop_lsb(b);
++      Piece pc = pos.piece_on(s);
++      Color c = color_of(pc);
++      PieceType pt = type_of(pc);
++      char role = v->xqRole[pt];
++      cnt[c][int(role)]++;
++      sc[c] += v->xqValue[pt];
++      egAdj[c] += v->xqValueEg[pt];
++      if (pos.sniper_types(c) & pt)       // a sniper is worth more than an ordinary piece
++      {
++          sc[c] += v->xqSniperMg;
++          egAdj[c] += v->xqSniperEg;
++      }
++      if (pt == KING)
++          continue;
++      if (nonroyal[c] < 2)
++          types[c][nonroyal[c]] = xq_type(role);
++      nonroyal[c]++;
++      mat[c] += v->xqValue[pt];
++      if (role == 'p' || role == 's')
++      {
++          pawns[c]++;
++          prr = c == WHITE ? int(rank_of(s)) : 7 - int(rank_of(s));
++      }
++      else
++      {
++          nonpawn += v->xqValue[pt];
++          pieceMat[c] += v->xqValue[pt];
++      }
++      if (role == 'b')
++          bishops[c]++;
++  }
++  const bool general[COLOR_NB] = { pos.king_type(WHITE) != KING, pos.king_type(BLACK) != KING };
++
++  // a king against a general: the solved endings
++  if (general[WHITE] != general[BLACK] && pos.count<KING>(WHITE) && pos.count<KING>(BLACK))
++  {
++      Color g = general[WHITE] ? WHITE : BLACK;
++      int npw = pawns[WHITE] + pawns[BLACK], known;
++      if ((npw <= 1 || !nonroyal[g]) && xq_endgame_known(pos, g, types, nonroyal, mat, npw == 1 ? prr : 0, v, known))
++      {
++          int e = g == WHITE ? known : -known;
++          e = e * (v->xqFiftyDiv - std::min(pos.rule50_count(), 100)) / v->xqFiftyDiv;
++          return (pos.side_to_move() == WHITE ? e : -e) + v->xqTempo;
++      }
++  }
++
++  // bare king/general: either a dead draw, or drive it to the edge
++  int mop = 0;
++  for (Color c : {WHITE, BLACK})
++  {
++      if (nonroyal[~c] || !nonroyal[c] || !pos.count<KING>(c) || !pos.count<KING>(~c))
++          continue;
++      if (!xq_can_mate_bare(cnt[c], general[c], v))
++          return 0;
++      int bonus = xq_mopup(pos, c, v);
++      mop += c == WHITE ? bonus : -bonus;
++  }
++  const int mg = std::min(nonpawn, 5000);
++  for (Color c : {WHITE, BLACK})
++      sc[c] += egAdj[c] * (5000 - mg) / 5000;
++
++  for (Bitboard b = occupied; b; )
++  {
++      Square s = pop_lsb(b);
++      Piece pc = pos.piece_on(s);
++      Color c = color_of(pc);
++      PieceType pt = type_of(pc);
++      char role = v->xqRole[pt];
++      int rr = c == WHITE ? int(rank_of(s)) : 7 - int(rank_of(s)), cen = xq_center(s);
++      int val = v->xqCentre[pt] * cen;
++      if (role == 'p')
++          val = v->xqPawnAdv[rr] + ((file_of(s) == FILE_D || file_of(s) == FILE_E) ? v->xqPawnCentre : 0);
++      else if (role == 's')
++          val = v->xqSoldierAdv[rr];
++      else if (role == 'r' || role == 'j')
++          val = rr == 6 ? v->xqSeventh : 0;
++      else if (pt == KING)
++      {
++          int open = popcount(attacks_bb<ROOK>(s, occupied) & ~occupied & pos.board_bb());
++          if (!general[c])
++              val = (mg * (-v->xqKingMg * rr) + (5000 - mg) * (v->xqKingEg * cen)) / 5000 - v->xqOpenK * open;
++          else
++              val = (mg * (v->xqGenBaseMg - v->xqGenMg * rr) + (5000 - mg) * (v->xqGenBaseEg + v->xqGenEg * cen)) / 5000
++                   - v->xqOpenG * open;
++      }
++      if (v->xqMobility[pt])
++      {
++          Bitboard m =  (pos.moves_from(c, pt, s) & ~occupied)
++                      | (pos.attacks_from(c, pt, s) & pos.pieces(~c));
++          val += v->xqMobility[pt] * popcount(m);
++      }
++      sc[c] += val;
++  }
++  for (Color c : {WHITE, BLACK})
++      if (bishops[c] >= 2)
++          sc[c] += v->xqBishopPair;
++
++  int e = sc[WHITE] - sc[BLACK] + mop;
++  // drawish endings: the stronger side has no pawns/soldiers and only a small edge in pieces,
++  // or it is the general's side without enough material to mate even a bare king
++  Color strong = e >= 0 ? WHITE : BLACK;
++  int scale = 128;
++  if (!pawns[strong] && !mop)
++  {
++      int rookValue = 0;
++      for (PieceType pt = PAWN; pt <= KING; ++pt)
++          if (v->xqRole[pt] == 'r')
++              rookValue = v->xqValue[pt];
++      if (pieceMat[strong] - pieceMat[~strong] < rookValue)
++          scale = v->xqScaleNoPawn;
++      if (general[strong] && !xq_can_mate_bare(cnt[strong], true, v))
++          scale = std::min(scale, v->xqScaleXq);
++  }
++  e = e * scale / 128;
++  e = e * (v->xqFiftyDiv - std::min(pos.rule50_count(), 100)) / v->xqFiftyDiv;   // no progress: drift towards a draw
++  return (pos.side_to_move() == WHITE ? e : -e) + v->xqTempo;
++}
++
+ Value Eval::evaluate(const Position& pos) {
+ 
+   Value v;
+ 
++  // xqchess variant: the evaluation fitted to its self-play results, scaled to internal units
++  if (pos.variant()->xqEval)
++      return std::clamp(Value(xq_evaluate(pos) * PawnValueEg / 100), VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
++
+   if (!Eval::useNNUE || !pos.nnue_applicable())
+       v = Evaluation<NO_TRACE>(pos).value();
+   else
+@@ -1671,6 +1876,15 @@ Value Eval::evaluate(const Position& pos) {
+ 
+ std::string Eval::trace(Position& pos) {
+ 
++  if (pos.variant()->xqEval)
++  {
++      int e = xq_evaluate(pos);
++      std::stringstream ss;
++      ss << "xqchess evaluation " << e << " (side to move), "
++         << std::showpos << std::fixed << std::setprecision(2) << (pos.side_to_move() == WHITE ? e : -e) / 100.0 << " (white side)";
++      return ss.str();
++  }
++
+   if (pos.checkers())
+       return "Final evaluation: none (in check)";
+ 
+diff --git a/src/evaluate.h b/src/evaluate.h
+index b7b7e23..209cec8 100644
+--- a/src/evaluate.h
++++ b/src/evaluate.h
+@@ -34,6 +34,7 @@ namespace Eval {
+ 
+   std::string trace(Position& pos);
+   Value evaluate(const Position& pos);
++  int xq_evaluate(const Position& pos);   // xqchess variant: centipawns for the side to move
+ 
+   extern bool useNNUE;
+   extern std::string eval_file_loaded;
+diff --git a/src/movegen.cpp b/src/movegen.cpp
+index a7b6a9f..103aa1b 100644
+--- a/src/movegen.cpp
++++ b/src/movegen.cpp
+@@ -366,6 +366,11 @@ namespace {
+         if (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+             while (epSquares)
+                 moveList = make_move_and_gating<EN_PASSANT>(pos, moveList, Us, from, pop_lsb(epSquares));
++
++        // Shots: a sniper takes the first enemy piece along a capture line and stays where it is
++        if ((Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS) && (pos.sniper_types(Us) & Pt))
++            for (Bitboard shots = attacks & pos.pieces(~Us) & target; shots; )
++                *moveList++ = make<SNIPE>(from, pop_lsb(shots));
+     }
+ 
+     return moveList;
+diff --git a/src/parser.cpp b/src/parser.cpp
+index 96f3504..07f3d82 100644
+--- a/src/parser.cpp
++++ b/src/parser.cpp
+@@ -16,6 +16,7 @@
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
++#include <algorithm>
+ #include <string>
+ #include <sstream>
+ 
+@@ -291,10 +292,10 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
+                 {
+                     // custom royal piece
+                     v->customPiece[CUSTOM_PIECES_ROYAL - CUSTOM_PIECES] = keyValue->second.substr(2);
+-                    v->kingType = CUSTOM_PIECES_ROYAL;
++                    v->kingType[WHITE] = v->kingType[BLACK] = CUSTOM_PIECES_ROYAL;
+                 }
+                 else
+-                    v->kingType = KING;
++                    v->kingType[WHITE] = v->kingType[BLACK] = KING;
+             }
+         }
+         // mobility region
+@@ -306,6 +307,30 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
+             parse_attribute("mobilityRegion" + color + capitalizedPiece, v->mobilityRegion[c][pt]);
+         }
+     }
++    // movement of one colour's royal piece, e.g. "kingTypeWhite = wazir" for a xiangqi general
++    for (Color c : {WHITE, BLACK})
++    {
++        const auto& kt = config.find(c == WHITE ? "kingTypeWhite" : "kingTypeBlack");
++        if (kt != config.end())
++        {
++            bool found = false;
++            for (PieceType pt = PAWN; pt <= KING; ++pt)
++                if (!is_custom(pt) && pieceMap.find(pt) != pieceMap.end() && piece_name(pt) == kt->second)
++                {
++                    v->kingType[c] = pt;
++                    found = true;
++                }
++            if (DoCheck && !found)
++                std::cerr << (c == WHITE ? "kingTypeWhite" : "kingTypeBlack") << " - Unknown piece type: " << kt->second << std::endl;
++        }
++    }
++    // snipers: pieces that can also capture without moving
++    parse_attribute("sniperTypes", v->sniperTypes[WHITE], v->pieceToChar);
++    parse_attribute("sniperTypes", v->sniperTypes[BLACK], v->pieceToChar);
++    parse_attribute("sniperTypesWhite", v->sniperTypes[WHITE], v->pieceToChar);
++    parse_attribute("sniperTypesBlack", v->sniperTypes[BLACK], v->pieceToChar);
++    parse_attribute("sniperBonusMg", v->sniperBonusMg);
++    parse_attribute("sniperBonusEg", v->sniperBonusEg);
+     // piece values
+     for (Phase phase : {MG, EG})
+     {
+@@ -492,6 +517,86 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
+     parse_attribute("makpongRule", v->makpongRule);
+     parse_attribute("flyingGeneral", v->flyingGeneral);
+     parse_attribute("soldierPromotionRank", v->soldierPromotionRank);
++    // xqchess evaluation
++    parse_attribute("xqEval", v->xqEval);
++    if (v->xqEval)
++    {
++        for (PieceType pt = PAWN; pt <= KING; ++pt)
++            v->xqRole[pt] = (v->pieceTypes & pt) ? char(tolower(v->pieceToChar[make_piece(WHITE, pt)])) : 0;
++        auto perPiece = [&](const std::string& key, int* table) {
++            const auto& it = config.find(key);
++            if (it == config.end())
++                return;
++            std::stringstream ss(it->second);
++            std::string item;
++            while (ss >> item)
++            {
++                size_t colon = item.find(':');
++                size_t idx = colon == 1 ? v->pieceToChar.find(char(toupper(item[0]))) : std::string::npos;
++                if (idx == std::string::npos || idx >= PIECE_TYPE_NB)
++                {
++                    if (DoCheck)
++                        std::cerr << key << " - Invalid entry: " << item << std::endl;
++                    continue;
++                }
++                std::stringstream value(item.substr(2));
++                if (!(value >> table[idx]) && DoCheck)
++                    std::cerr << key << " - Invalid value: " << item << std::endl;
++            }
++        };
++        perPiece("xqValue", v->xqValue);
++        perPiece("xqValueEg", v->xqValueEg);
++        perPiece("xqCentre", v->xqCentre);
++        perPiece("xqMobility", v->xqMobility);
++        auto perRank = [&](const std::string& key, int* table) {
++            const auto& it = config.find(key);
++            if (it == config.end())
++                return;
++            std::stringstream ss(it->second);
++            for (int r = 0; r < 8 && ss >> table[r]; ++r) {}
++        };
++        perRank("xqPawnAdv", v->xqPawnAdv);
++        perRank("xqSoldierAdv", v->xqSoldierAdv);
++        parse_attribute("xqSeventh", v->xqSeventh);
++        parse_attribute("xqKingMg", v->xqKingMg);
++        parse_attribute("xqKingEg", v->xqKingEg);
++        parse_attribute("xqGenMg", v->xqGenMg);
++        parse_attribute("xqGenEg", v->xqGenEg);
++        parse_attribute("xqGenBaseMg", v->xqGenBaseMg);
++        parse_attribute("xqGenBaseEg", v->xqGenBaseEg);
++        parse_attribute("xqOpenK", v->xqOpenK);
++        parse_attribute("xqSniperMg", v->xqSniperMg);
++        parse_attribute("xqSniperEg", v->xqSniperEg);
++        parse_attribute("xqOpenG", v->xqOpenG);
++        parse_attribute("xqBishopPair", v->xqBishopPair);
++        parse_attribute("xqPawnCentre", v->xqPawnCentre);
++        parse_attribute("xqTempo", v->xqTempo);
++        parse_attribute("xqMopupEdge", v->xqMopupEdge);
++        parse_attribute("xqMopupClose", v->xqMopupClose);
++        parse_attribute("xqScaleNoPawn", v->xqScaleNoPawn);
++        parse_attribute("xqScaleXq", v->xqScaleXq);
++        parse_attribute("xqFiftyDiv", v->xqFiftyDiv);
++        parse_attribute("xqSoldierPromotion", v->xqSoldierPromotion);
++        parse_attribute("xqTbWin", v->xqTbWin);
++        const auto& eg = config.find("xqEndgame");            // "key:centipawns key:centipawns ..."
++        if (eg != config.end())
++        {
++            v->xqEndgame.clear();
++            std::stringstream ss(eg->second);
++            std::string item;
++            while (ss >> item)
++            {
++                size_t colon = item.find(':');
++                std::stringstream k(item.substr(0, colon)), c(colon == std::string::npos ? "" : item.substr(colon + 1));
++                int key, cp;
++                if (colon != std::string::npos && (k >> key) && (c >> cp))
++                    v->xqEndgame.emplace_back(key, cp);
++                else if (DoCheck)
++                    std::cerr << "xqEndgame - Invalid entry: " << item << std::endl;
++            }
++            std::sort(v->xqEndgame.begin(), v->xqEndgame.end());
++        }
++    }
+     parse_attribute("flipEnclosedPieces", v->flipEnclosedPieces);
+     // game end
+     parse_attribute("nMoveRuleTypes", v->nMoveRuleTypes[WHITE], v->pieceToChar);
+@@ -607,16 +712,17 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
+         // We can not fully check support for custom king movements at this point,
+         // since custom pieces are only initialized on loading of the variant.
+         // We will assume this is valid, but it might cause problems later if it's not.
+-        if ((v->pieceTypes & KING) && !is_custom(v->kingType))
+-        {
+-            const PieceInfo* pi = pieceMap.find(v->kingType)->second;
+-            if (   pi->hopper[0][MODALITY_QUIET].size()
+-                || pi->hopper[0][MODALITY_CAPTURE].size()
+-                || std::any_of(pi->steps[0][MODALITY_CAPTURE].begin(),
+-                               pi->steps[0][MODALITY_CAPTURE].end(),
+-                               [](const std::pair<const Direction, int>& d) { return d.second; }))
+-                std::cerr << piece_name(v->kingType) << " is not supported as kingType." << std::endl;
+-        }
++        for (Color c : {WHITE, BLACK})
++            if ((v->pieceTypes & KING) && !is_custom(v->kingType[c]))
++            {
++                const PieceInfo* pi = pieceMap.find(v->kingType[c])->second;
++                if (   pi->hopper[0][MODALITY_QUIET].size()
++                    || pi->hopper[0][MODALITY_CAPTURE].size()
++                    || std::any_of(pi->steps[0][MODALITY_CAPTURE].begin(),
++                                   pi->steps[0][MODALITY_CAPTURE].end(),
++                                   [](const std::pair<const Direction, int>& d) { return d.second; }))
++                    std::cerr << piece_name(v->kingType[c]) << " is not supported as kingType." << std::endl;
++            }
+     }
+ 
+     // Check for limitations. These combinations of options are not supported
+diff --git a/src/position.cpp b/src/position.cpp
+index 2b5ae3a..a4ff7ef 100644
+--- a/src/position.cpp
++++ b/src/position.cpp
+@@ -587,7 +587,7 @@ void Position::set_check_info(StateInfo* si) const {
+   for (PieceSet ps = piece_types(); ps;)
+   {
+       PieceType pt = pop_lsb(ps);
+-      PieceType movePt = pt == KING ? king_type() : pt;
++      PieceType movePt = pt == KING ? king_type(sideToMove) : pt;
+       si->checkSquares[pt] = ksq != SQ_NONE ? attacks_bb(~sideToMove, movePt, ksq, pieces()) : Bitboard(0);
+       // Collect special piece types that require slower check and evasion detection
+       if (AttackRiderTypes[movePt] & NON_SLIDING_RIDERS)
+@@ -962,7 +962,7 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
+       PieceType pt = pop_lsb(ps);
+       if (board_bb(c, pt) & s)
+       {
+-          PieceType move_pt = pt == KING ? king_type() : pt;
++          PieceType move_pt = pt == KING ? king_type(c) : pt;
+           // Consider asymmetrical moves (e.g., horse)
+           if (AttackRiderTypes[move_pt] & ASYMMETRICAL_RIDERS)
+           {
+@@ -985,7 +985,7 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
+   if (diagonal_lines() & s)
+   {
+       Bitboard diags = 0;
+-      if (king_type() == WAZIR)
++      if (king_type(c) == WAZIR)
+           diags |= attacks_bb(~c, FERS, s, occupied) & pieces(c, KING);
+       diags |= attacks_bb(~c, FERS, s, occupied) & pieces(c, WAZIR);
+       diags |= attacks_bb(~c, PAWN, s, occupied) & pieces(c, SOLDIER);
+@@ -1120,6 +1120,19 @@ bool Position::legal(Move m) const {
+               return false;
+   }
+ 
++  // A shot leaves the sniper where it is and empties the target square, so it is
++  // illegal only if the target was shielding our king (a pinned sniper may shoot)
++  if (type_of(m) == SNIPE)
++  {
++      if (!count<KING>(us))
++          return true;
++      Square ksq = square<KING>(us);
++      Bitboard occupied = pieces() ^ to;
++      if (var->flyingGeneral && (attacks_bb(~us, ROOK, ksq, occupied) & pieces(~us, KING)))
++          return false;
++      return !(attackers_to(ksq, occupied, ~us, pieces(JANGGI_CANNON) & ~square_bb(to)) & ~square_bb(to));
++  }
++
+   // Check for attacks to pseudo-royal pieces
+   if (var->extinctionPseudoRoyal)
+   {
+@@ -1440,6 +1453,12 @@ bool Position::gives_check(Move m) const {
+   if (!count<KING>(~sideToMove))
+       return false;
+ 
++  // A shot only removes the target: it checks if that uncovers one of our pieces
++  // (the sniper's own line included)
++  if (type_of(m) == SNIPE)
++      return attackers_to(square<KING>(~sideToMove), pieces() ^ to, sideToMove, pieces(JANGGI_CANNON) & ~square_bb(to))
++            & pieces(sideToMove);
++
+   Bitboard occupied = (type_of(m) != DROP ? pieces() ^ from : pieces()) | to;
+   Bitboard janggiCannons = pieces(JANGGI_CANNON);
+   if (type_of(moved_piece(m)) == JANGGI_CANNON)
+@@ -1685,7 +1704,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
+       // Reset rule 50 counter for irreversible drops
+       st->rule50 = 0;
+   }
+-  else
++  else if (type_of(m) != SNIPE) // a sniper stays where it is
+   {
+       k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
+ 
+@@ -1704,10 +1723,10 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
+       k ^= Zobrist::enpassant[file_of(pop_lsb(st->epSquares))];
+ 
+   // Update castling rights if needed
+-  if (type_of(m) != DROP && !is_pass(m) && st->castlingRights && (castlingRightsMask[from] | castlingRightsMask[to]))
++  if (type_of(m) != DROP && !is_pass(m) && st->castlingRights && ((type_of(m) == SNIPE ? 0 : castlingRightsMask[from]) | castlingRightsMask[to]))
+   {
+       k ^= Zobrist::castling[st->castlingRights];
+-      st->castlingRights &= ~(castlingRightsMask[from] | castlingRightsMask[to]);
++      st->castlingRights &= ~((type_of(m) == SNIPE ? 0 : castlingRightsMask[from]) | castlingRightsMask[to]);
+ 
+       // Remove castling rights from opponent on the same side if oppositeCastling
+       if ((var->oppositeCastling) && (type_of(m) == CASTLING))
+@@ -1804,6 +1823,19 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
+           }
+       }
+   }
++  else if (type_of(m) == SNIPE)
++  {
++      // The sniper does not move: the only change is the captured piece leaving the board
++      if (Eval::useNNUE)
++      {
++          dp.dirty_num = 1;
++          dp.piece[0] = dp.piece[1];
++          dp.handPiece[0] = dp.handPiece[1];
++          dp.handCount[0] = dp.handCount[1];
++          dp.from[0] = dp.from[1];
++          dp.to[0] = SQ_NONE;
++      }
++  }
+   else if (type_of(m) != CASTLING)
+   {
+       if (Eval::useNNUE)
+@@ -1816,8 +1848,11 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
+       move_piece(from, to);
+   }
+ 
++  // A shot needs none of the extra work for moved pieces below
++  if (type_of(m) == SNIPE) {}
++
+   // If the moving piece is a pawn do some special extra work
+-  if (type_of(pc) == PAWN)
++  else if (type_of(pc) == PAWN)
+   {
+       if (type_of(m) == PROMOTION || type_of(m) == PIECE_PROMOTION)
+       {
+@@ -1974,7 +2009,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
+   // Remove gates
+   if (gating())
+   {
+-      if (is_ok(from) && (gates(us) & from))
++      if (is_ok(from) && type_of(m) != SNIPE && (gates(us) & from))
+           st->gatesBB[us] ^= from;
+       if (type_of(m) == CASTLING && (gates(us) & to_sq(m)))
+           st->gatesBB[us] ^= to_sq(m);
+@@ -2152,7 +2187,7 @@ void Position::undo_move(Move m) {
+   Square to = to_sq(m);
+   Piece pc = piece_on(to);
+ 
+-  assert(type_of(m) == DROP || empty(from) || type_of(m) == CASTLING || is_gating(m)
++  assert(type_of(m) == DROP || empty(from) || type_of(m) == CASTLING || is_gating(m) || type_of(m) == SNIPE
+          || (type_of(m) == PROMOTION && sittuyin_promotion())
+          || (is_pass(m) && (pass(us) || var->wallOrMove)));
+   assert(type_of(st->capturedPiece) != KING);
+@@ -2230,7 +2265,7 @@ void Position::undo_move(Move m) {
+   {
+       if (type_of(m) == DROP)
+           undrop_piece(make_piece(us, in_hand_piece_type(m)), to); // Remove the dropped piece
+-      else
++      else if (type_of(m) != SNIPE) // a sniper never left its square
+           move_piece(to, from); // Put the piece back at the source square
+ 
+       if (st->capturedPiece)
+@@ -2379,6 +2414,8 @@ Key Position::key_after(Move m) const {
+               ^ Zobrist::inHand[removeFromHand][pieceCountInHand[color_of(removeFromHand)][type_of(removeFromHand)]];
+       }
+   }
++  if (type_of(m) == SNIPE)
++      return k;
+   if (type_of(m) == DROP)
+   {
+       Piece pc_hand = make_piece(sideToMove, in_hand_piece_type(m));
+@@ -2470,6 +2507,10 @@ bool Position::see_ge(Move m, Value threshold) const {
+ 
+   assert(is_ok(m));
+ 
++  // A shot takes the target and leaves nothing on its square to be taken back
++  if (type_of(m) == SNIPE)
++      return PieceValue[MG][piece_on(to_sq(m))] >= threshold;
++
+   // Only deal with normal moves, assume others pass a simple SEE
+   if (type_of(m) != NORMAL && type_of(m) != DROP && type_of(m) != PIECE_PROMOTION)
+       return VALUE_ZERO >= threshold;
+@@ -2539,6 +2580,14 @@ bool Position::see_ge(Move m, Value threshold) const {
+       if (!(stmAttackers = attackers & pieces(stm)))
+           break;
+ 
++      // A sniper (even a pinned one) shoots the piece on the square: nothing is left
++      // there to take back, so the exchange ends in favour of stm
++      if (sniper_types(stm) && (stmAttackers & sniper_pieces(stm)))
++      {
++          res ^= 1;
++          break;
++      }
++
+       // Don't allow pinned pieces to attack as long as there are
+       // pinners on their original square.
+       if (pinners(~stm) & occupied)
+diff --git a/src/position.h b/src/position.h
+index 685c079..3c6a3c8 100644
+--- a/src/position.h
++++ b/src/position.h
+@@ -153,7 +153,9 @@ public:
+   File castling_king_file() const;
+   PieceType castling_king_piece(Color c) const;
+   PieceSet castling_rook_pieces(Color c) const;
+-  PieceType king_type() const;
++  PieceType king_type(Color c) const;
++  PieceSet sniper_types(Color c) const;
++  Bitboard sniper_pieces(Color c) const;
+   PieceType nnue_king() const;
+   Square nnue_king_square(Color c) const;
+   bool nnue_use_pockets() const;
+@@ -573,9 +575,22 @@ inline PieceSet Position::castling_rook_pieces(Color c) const {
+   return var->castlingRookPieces[c];
+ }
+ 
+-inline PieceType Position::king_type() const {
++inline PieceType Position::king_type(Color c) const {
+   assert(var != nullptr);
+-  return var->kingType;
++  return var->kingType[c];
++}
++
++inline PieceSet Position::sniper_types(Color c) const {
++  assert(var != nullptr);
++  return var->sniperTypes[c];
++}
++
++// The pieces of colour c that can shoot (take along their capture lines without moving)
++inline Bitboard Position::sniper_pieces(Color c) const {
++  Bitboard b = 0;
++  for (PieceSet ps = sniper_types(c); ps;)
++      b |= pieces(c, pop_lsb(ps));
++  return b;
+ }
+ 
+ inline PieceType Position::nnue_king() const {
+@@ -1276,7 +1291,7 @@ inline Bitboard Position::attacks_from(Color c, PieceType pt, Square s) const {
+   if (var->fastAttacks || var->fastAttacks2)
+       return attacks_bb(c, pt, s, byTypeBB[ALL_PIECES]) & board_bb();
+ 
+-  PieceType movePt = pt == KING ? king_type() : pt;
++  PieceType movePt = pt == KING ? king_type(c) : pt;
+   Bitboard b = attacks_bb(c, movePt, s, byTypeBB[ALL_PIECES]);
+   // Xiangqi soldier
+   if (pt == SOLDIER && !(promoted_soldiers(c) & s))
+@@ -1306,7 +1321,7 @@ inline Bitboard Position::moves_from(Color c, PieceType pt, Square s) const {
+   if (var->fastAttacks || var->fastAttacks2)
+       return moves_bb(c, pt, s, byTypeBB[ALL_PIECES]) & board_bb();
+ 
+-  PieceType movePt = pt == KING ? king_type() : pt;
++  PieceType movePt = pt == KING ? king_type(c) : pt;
+   Bitboard b = moves_bb(c, movePt, s, byTypeBB[ALL_PIECES]);
+   // Add initial moves
+   if (double_step_region(c) & s)
+diff --git a/src/psqt.cpp b/src/psqt.cpp
+index 25b5471..f54191d 100644
+--- a/src/psqt.cpp
++++ b/src/psqt.cpp
+@@ -348,6 +348,17 @@ void init(const Variant* v) {
+       psq[ pc][SQ_NONE] = score + make_score(35, 10) * (1 + !isSlider);
+       psq[~pc][SQ_NONE] = -psq[pc][SQ_NONE];
+   }
++
++  // A sniper (see Variant::sniperTypes) is worth more than an ordinary piece of its type
++  for (Color c : {WHITE, BLACK})
++      for (PieceSet ps = v->sniperTypes[c]; ps;)
++      {
++          Piece pc = make_piece(c, pop_lsb(ps));
++          Score bonus = make_score(v->sniperBonusMg, v->sniperBonusEg) * (c == WHITE ? 1 : -1);
++          for (Square s = SQ_A1; s <= SQ_MAX; ++s)
++              psq[pc][s] += bonus;
++          psq[pc][SQ_NONE] += bonus;
++      }
+ }
+ 
+ } // namespace PSQT
+diff --git a/src/types.h b/src/types.h
+index 844d195..e2c7777 100644
+--- a/src/types.h
++++ b/src/types.h
+@@ -270,6 +270,7 @@ enum MoveType : int {
+   PIECE_PROMOTION    = 5 << (2 * SQUARE_BITS),
+   PIECE_DEMOTION     = 6 << (2 * SQUARE_BITS),
+   SPECIAL            = 7 << (2 * SQUARE_BITS),
++  SNIPE              = 8 << (2 * SQUARE_BITS),   // a sniper takes the piece on 'to' without moving
+ };
+ 
+ constexpr int MOVE_TYPE_BITS = 4;
+diff --git a/src/uci.cpp b/src/uci.cpp
+index 584977a..8664883 100644
+--- a/src/uci.cpp
++++ b/src/uci.cpp
+@@ -544,6 +544,8 @@ string UCI::move(const Position& pos, Move m) {
+       move += '+';
+   else if (type_of(m) == PIECE_DEMOTION)
+       move += '-';
++  else if (type_of(m) == SNIPE)
++      move += 's'; // a shot, e.g. c1h6s: the sniper on c1 takes the piece on h6 and stays on c1
+   else if (is_gating(m))
+   {
+       move += pos.piece_to_char()[make_piece(BLACK, gating_type(m))];
+diff --git a/src/ucioption.cpp b/src/ucioption.cpp
+index 0326e04..d0399e2 100644
+--- a/src/ucioption.cpp
++++ b/src/ucioption.cpp
+@@ -125,7 +125,7 @@ void on_variant_change(const Option &o) {
+             // Janggi palace moves
+             if (v->diagonalLines)
+             {
+-                PieceType pt2 = pt == KING ? v->kingType : pt;
++                PieceType pt2 = pt == KING ? v->kingType[WHITE] : pt;
+                 if (pt2 == WAZIR)
+                     suffix += "F";
+                 else if (pt2 == SOLDIER)
+@@ -149,7 +149,7 @@ void on_variant_change(const Option &o) {
+                     suffix += "s";
+                 suffix += "@" + std::to_string(pt == PAWN && !v->promotionZonePawnDrops && v->promotionRegion[WHITE] ? rank_of(lsb(v->promotionRegion[WHITE])) : v->maxRank + 1);
+             }
+-            sync_cout << "piece " << v->pieceToChar[pt] << "& " << pieceMap.find(pt == KING ? v->kingType : pt)->second->betza << suffix << sync_endl;
++            sync_cout << "piece " << v->pieceToChar[pt] << "& " << pieceMap.find(pt == KING ? v->kingType[WHITE] : pt)->second->betza << suffix << sync_endl;
+             PieceType promType = v->promotedPieceType[pt];
+             if (promType)
+                 sync_cout << "piece +" << v->pieceToChar[pt] << "& " << pieceMap.find(promType)->second->betza << sync_endl;
+diff --git a/src/variant.cpp b/src/variant.cpp
+index 9ec8c49..8cd34db 100644
+--- a/src/variant.cpp
++++ b/src/variant.cpp
+@@ -369,7 +369,7 @@ namespace {
+         v->add_piece(COMMONER, 'm');
+         v->remove_piece(KNIGHT);
+         v->startFen = "rmbqkbmr/pppppppp/8/8/8/8/PPPPPPPP/RMBQKBMR w KQkq - 0 1";
+-        v->kingType = KNIGHT;
++        v->kingType[WHITE] = v->kingType[BLACK] = KNIGHT;
+         v->castlingKingPiece[WHITE] = v->castlingKingPiece[BLACK] = KING;
+         v->promotionPieceTypes[WHITE] = piece_set(COMMONER) | QUEEN | ROOK | BISHOP;
+         v->promotionPieceTypes[BLACK] = piece_set(COMMONER) | QUEEN | ROOK | BISHOP;
+@@ -1236,7 +1236,7 @@ namespace {
+         v->startFen = "rcnkncr/p1ppp1p/7/7/7/P1PPP1P/RCNKNCR w - - 0 1";
+         v->mobilityRegion[WHITE][KING] = (Rank1BB | Rank2BB | Rank3BB) & (FileCBB | FileDBB | FileEBB);
+         v->mobilityRegion[BLACK][KING] = (Rank5BB | Rank6BB | Rank7BB) & (FileCBB | FileDBB | FileEBB);
+-        v->kingType = WAZIR;
++        v->kingType[WHITE] = v->kingType[BLACK] = WAZIR;
+         v->doubleStep = false;
+         v->castling = false;
+         v->stalemateValue = -VALUE_MATE;
+@@ -1993,12 +1993,12 @@ Variant* Variant::conclude() {
+           restrictedMobility = true;
+     }
+     fastAttacks =  !(pieceTypes & ~(CHESS_PIECES | COMMON_FAIRY_PIECES))
+-                  && kingType == KING
++                  && kingType[WHITE] == KING && kingType[BLACK] == KING
+                   && !restrictedMobility
+                   && !cambodianMoves
+                   && !diagonalLines;
+     fastAttacks2 =  !(pieceTypes & ~(SHOGI_PIECES | COMMON_STEP_PIECES))
+-                  && kingType == KING
++                  && kingType[WHITE] == KING && kingType[BLACK] == KING
+                   && !restrictedMobility
+                   && !cambodianMoves
+                   && !diagonalLines;
+@@ -2101,7 +2101,7 @@ Variant* Variant::conclude() {
+                     && !capturesToHand
+                     && !twoBoards
+                     && !restrictedMobility
+-                    && kingType == KING
++                    && kingType[WHITE] == KING && kingType[BLACK] == KING
+                    )
+                  ? endgameEval : NO_EG_EVAL;
+ 
+diff --git a/src/variant.h b/src/variant.h
+index 0e6d44c..18c861f 100644
+--- a/src/variant.h
++++ b/src/variant.h
+@@ -84,7 +84,12 @@ struct Variant {
+   File castlingRookQueensideFile = FILE_A; // only has to match if rook is not in corner in non-960 variants
+   PieceSet castlingRookPieces[COLOR_NB] = {piece_set(ROOK), piece_set(ROOK)};
+   bool oppositeCastling = false;
+-  PieceType kingType = KING;
++  PieceType kingType[COLOR_NB] = {KING, KING};   // movement of each colour's royal piece (e.g., wazir for a xiangqi general)
++  // Snipers: pieces of these types can also take the first enemy piece along one of their
++  // capture lines without moving (a SNIPE move); the bonus is their extra value for the
++  // classical evaluation, in internal units
++  PieceSet sniperTypes[COLOR_NB] = {NO_PIECE_SET, NO_PIECE_SET};
++  int sniperBonusMg = 0, sniperBonusEg = 0;
+   bool checking = true;
+   bool dropChecks = true;
+   bool mustCapture = false;
+@@ -116,6 +121,22 @@ struct Variant {
+   bool makpongRule = false;
+   bool flyingGeneral = false;
+   Rank soldierPromotionRank = RANK_1;
++  // Evaluation of the xqchess variant (a Western army against a Xiangqi army), fitted to game
++  // results; all weights in centipawns, piece-type tables indexed by piece type (see xq_evaluate)
++  bool xqEval = false;
++  char xqRole[PIECE_TYPE_NB] = {};        // role of each piece type: p n b r q s h e a j c, k = royal
++  int xqValue[PIECE_TYPE_NB] = {};        // middlegame piece values
++  int xqValueEg[PIECE_TYPE_NB] = {};      // endgame corrections
++  int xqCentre[PIECE_TYPE_NB] = {};       // centralisation weight
++  int xqMobility[PIECE_TYPE_NB] = {};     // weight per pseudo-legal move
++  int xqPawnAdv[8] = {};                  // pawn advancement by relative rank
++  int xqSoldierAdv[8] = {};               // soldier advancement by relative rank
++  int xqSeventh = 0, xqKingMg = 0, xqKingEg = 0, xqGenMg = 0, xqGenEg = 0, xqGenBaseMg = 0, xqGenBaseEg = 0,
++      xqOpenK = 0, xqOpenG = 0, xqBishopPair = 0, xqPawnCentre = 0, xqTempo = 0, xqMopupEdge = 0, xqMopupClose = 0,
++      xqScaleNoPawn = 128, xqScaleXq = 128, xqFiftyDiv = 1000000, xqTbWin = 1000;
++  bool xqSoldierPromotion = true;         // soldiers can still promote (for the can-mate test)
++  int xqSniperMg = 0, xqSniperEg = 0;     // extra value of a sniper (see sniperTypes)
++  std::vector<std::pair<int, int>> xqEndgame;   // solved endings: (material key, centipawns), sorted by key
+   EnclosingRule flipEnclosedPieces = NO_ENCLOSING;
+   bool freeDrops = false;
+ 

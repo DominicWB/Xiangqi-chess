@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en" data-board="brown">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f0f0f">
+<title>Play the engines · xqchess</title>
+<link rel="icon" href="/pieces/wSniper.png">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-mode="setup">
+<header class="topbar">
+  <a class="brand" href="/" aria-label="xqchess: play the engines">
+    <img src="/pieces/wSniper.png" alt="">
+    <span>xqchess</span><small>play the engines</small>
+  </a>
+  <div class="top-actions">
+    <button class="btn ghost" id="top-new" type="button">New game</button>
+    <button class="icon-btn" id="btn-settings" type="button" title="Settings" aria-label="Settings" data-icon="gear"></button>
+  </div>
+</header>
+
+<main class="app">
+  <section class="arena" id="arena" aria-label="Game">
+    <div class="player" id="player-engine">
+      <div class="avatar engine"><img src="/pieces/bK.png" alt=""></div>
+      <div class="who">
+        <div class="name-row">
+          <span class="name" id="engine-name">Engine</span>
+          <span class="chip" id="engine-level"></span>
+          <span class="thinking" id="thinking" hidden aria-label="thinking"><i></i><i></i><i></i></span>
+        </div>
+        <div class="captures" id="cap-engine"></div>
+      </div>
+    </div>
+
+    <div class="board-row">
+      <div class="evalbar" id="evalbar" hidden>
+        <div class="eval-fill" id="eval-fill"></div>
+        <span class="eval-label" id="eval-label"></span>
+      </div>
+      <div class="board-wrap" id="board-wrap">
+        <div class="board" id="board" aria-label="Board">
+          <div class="squares" id="squares"></div>
+          <div class="pieces" id="pieces"></div>
+          <svg class="fx" id="fx" viewBox="0 0 800 800" aria-hidden="true"></svg>
+          <div class="overlay" id="overlay"></div>
+        </div>
+        <div class="choice" id="choice" hidden></div>
+        <div class="result" id="result" hidden>
+          <div class="result-card" role="dialog" aria-labelledby="result-head">
+            <button class="close" id="result-close" type="button" aria-label="Close" data-icon="close"></button>
+            <div class="emblem" id="result-emblem"></div>
+            <h3 id="result-head"></h3>
+            <p id="result-text"></p>
+            <div class="result-actions">
+              <button class="btn primary" id="result-next" type="button"></button>
+              <button class="btn" id="result-again" type="button">Play again</button>
+              <button class="btn" id="result-new" type="button">Another challenge</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="player" id="player-you">
+      <div class="avatar you"><img id="you-icon" src="/pieces/wSniper.png" alt=""></div>
+      <div class="who">
+        <div class="name-row">
+          <span class="name">You</span>
+          <span class="chip" id="you-army">White</span>
+        </div>
+        <div class="captures" id="cap-you"></div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="panel" id="panel">
+    <section class="setup" id="setup" aria-label="New game">
+      <div class="setup-scroll" id="setup-scroll">
+        <div class="panel-head">
+          <h1>Choose a challenge</h1>
+          <button class="link" id="back-to-game" type="button" hidden>Back to the game</button>
+        </div>
+        <p class="lead">You play White against an engine running on this computer.</p>
+        <div class="cards" id="cards"></div>
+        <details class="custom" id="custom">
+          <summary>Or start from a position of your own</summary>
+          <label class="fen-label" for="fen">Position (FEN)</label>
+          <textarea id="fen" rows="2" spellcheck="false" autocomplete="off"
+                    placeholder="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"></textarea>
+          <label class="check"><input type="checkbox" id="fen-snipers"> White's bishops are snipers</label>
+          <p class="help" id="fen-help">If Black is to move, the engine starts.</p>
+        </details>
+      </div>
+      <div class="setup-foot">
+      <div class="field">
+        <div class="field-head"><span>Level</span><strong id="level-name"></strong></div>
+        <input type="range" id="level" min="1" max="8" step="1" value="8" aria-label="Level">
+        <div class="ticks" aria-hidden="true"><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span></div>
+        <p class="help" id="level-desc"></p>
+      </div>
+      <div class="field">
+        <div class="field-head"><span>Engine</span></div>
+        <div class="segmented" id="engines" role="radiogroup" aria-label="Engine"></div>
+        <p class="help" id="engine-desc"></p>
+      </div>
+      <button class="btn primary big" id="play" type="button">Play</button>
+      <p class="error" id="setup-error" hidden></p>
+      </div>
+    </section>
+
+    <section class="game" id="game" hidden aria-label="Moves">
+      <div class="game-head">
+        <img id="game-icon" src="/pieces/wSniper.png" alt="">
+        <div class="game-title">
+          <h2 id="game-title"></h2>
+          <p id="game-sub"></p>
+        </div>
+      </div>
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+      <div class="moves" id="moves"></div>
+      <div class="nav">
+        <button class="icon-btn" id="nav-first" type="button" title="First position (Home)" aria-label="First position" data-icon="first"></button>
+        <button class="icon-btn" id="nav-prev" type="button" title="Previous move (←)" aria-label="Previous move" data-icon="prev"></button>
+        <button class="icon-btn" id="nav-next" type="button" title="Next move (→)" aria-label="Next move" data-icon="next"></button>
+        <button class="icon-btn" id="nav-last" type="button" title="Current position (End)" aria-label="Current position" data-icon="last"></button>
+      </div>
+      <div class="actions">
+        <button class="btn" id="btn-undo" type="button" title="Take back your last move"><span data-icon="undo"></span>Undo</button>
+        <button class="btn" id="btn-hint" type="button" title="Ask the engine for a move"><span data-icon="bulb"></span>Hint</button>
+        <button class="btn" id="btn-resign" type="button" title="Give up this game"><span data-icon="flag"></span><span class="label">Resign</span></button>
+      </div>
+      <div class="game-foot">
+        <label class="level-pick">Level
+          <select id="game-level" aria-label="Level for the engine's next moves"></select>
+        </label>
+        <button class="icon-btn" id="btn-flip" type="button" title="Flip the board" aria-label="Flip the board" data-icon="flip"></button>
+        <button class="icon-btn" id="btn-copy" type="button" title="Copy the position (FEN)" aria-label="Copy the position" data-icon="copy"></button>
+        <button class="icon-btn" id="btn-pgn" type="button" title="Download the game (PGN; the analysis board can open it)" aria-label="Download the game" data-icon="download"></button>
+      </div>
+      <div class="game-new">
+        <button class="btn primary" id="btn-new" type="button">New game</button>
+      </div>
+    </section>
+  </aside>
+</main>
+
+<dialog id="settings" aria-labelledby="settings-title">
+  <form method="dialog" class="settings">
+    <div class="dlg-head">
+      <h2 id="settings-title">Settings</h2>
+      <button class="icon-btn" value="close" aria-label="Close" data-icon="close"></button>
+    </div>
+    <label class="toggle"><input type="checkbox" data-setting="sound"><span>Sounds</span></label>
+    <label class="toggle"><input type="checkbox" data-setting="hints"><span>Show where a piece can move</span></label>
+    <label class="toggle"><input type="checkbox" data-setting="evalbar"><span>Evaluation bar <small>(the engine's opinion after each of its moves)</small></span></label>
+    <label class="toggle"><input type="checkbox" data-setting="coords"><span>Coordinates on the board</span></label>
+    <label class="toggle"><input type="checkbox" data-setting="animate"><span>Move animations</span></label>
+    <div class="themes-row">
+      <span>Board</span>
+      <div class="themes" id="themes">
+        <button type="button" class="theme" data-theme="brown" title="Brown" aria-label="Brown board"></button>
+        <button type="button" class="theme" data-theme="green" title="Green" aria-label="Green board"></button>
+        <button type="button" class="theme" data-theme="blue" title="Blue" aria-label="Blue board"></button>
+        <button type="button" class="theme" data-theme="grey" title="Grey" aria-label="Grey board"></button>
+      </div>
+    </div>
+    <div class="dlg-foot" id="server-row">
+      <p class="help">The engines run in <code>webplay.py</code> on this computer.</p>
+      <button class="btn danger" type="button" id="stop-server">Stop the server</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden role="alert"></div>
+<div class="fatal" id="fatal" hidden><div class="fatal-card"><h2 id="fatal-head"></h2><p id="fatal-text"></p></div></div>
+<script src="/app.js"></script>
+</body>
+</html>

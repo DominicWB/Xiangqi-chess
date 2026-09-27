@@ -1,0 +1,6 @@
+# Nothing here is needed for playing: the web page (webplay.py), the analysis board (gui.py) and the
+# engines use only the Python standard library.  These optional packages add:
+Pillow        # exact resizing of the piece pictures on the analysis board
+numpy         # stats.py and the tuning tools
+scipy         # stats.py and the tuning tools
+matplotlib    # stats.py --plot
